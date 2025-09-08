@@ -1,0 +1,13 @@
+query {
+  devices(first: 5) {
+    edges {
+      node {
+        id
+        name
+        status
+        createdAt
+        updatedAt
+      }
+    }
+  }
+}
