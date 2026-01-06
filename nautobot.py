@@ -46,6 +46,30 @@ query DeviceInventory($limit: Int!, $offset: Int!) {
 """
 
 
+def prune_empty(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            cleaned_item = prune_empty(item)
+            if cleaned_item is None:
+                continue
+            cleaned[key] = cleaned_item
+        return cleaned or None
+    if isinstance(value, list):
+        cleaned_list = []
+        for item in value:
+            cleaned_item = prune_empty(item)
+            if cleaned_item is None:
+                continue
+            cleaned_list.append(cleaned_item)
+        return cleaned_list or None
+    if isinstance(value, str) and value == "":
+        return None
+    return value
+
+
 def send_batch(session, events):
     if not events:
         return 0
@@ -89,6 +113,9 @@ def main():
             break
 
         for device in devices:
+            device = prune_empty(device)
+            if not device:
+                continue
             event = {
                 "index": SPLUNK_HEC_INDEX,
                 "sourcetype": SPLUNK_HEC_SOURCETYPE,
