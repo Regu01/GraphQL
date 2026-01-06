@@ -146,6 +146,20 @@ def apply_blacklist(data, blacklist):
     return {k: v for k, v in data.items() if k not in blacklist}
 
 
+def remove_nulls(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for k, v in value.items():
+            if v is None:
+                continue
+            cleaned_value = remove_nulls(v)
+            cleaned[k] = cleaned_value
+        return cleaned
+    if isinstance(value, list):
+        return [remove_nulls(v) for v in value if v is not None]
+    return value
+
+
 def replace_fields(data, fields_map, caches):
     for field, cache_key in fields_map.items():
         if field in data:
@@ -193,6 +207,7 @@ def export_devices():
         for d in devices:
             data = record_to_dict(d)
             data = replace_fields(data, fields_map, caches)
+            data = remove_nulls(data)
             data = apply_blacklist(data, blacklist)
             batch.append(splunk_event("nautobot:dcim:device", data))
 
