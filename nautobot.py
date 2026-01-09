@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 import json
+import os
+import time
+
 import requests
 
-NAUTOBOT_GRAPHQL_URL = "https://nautobot.example.com/graphql/"
+# Nautobot settings
+NAUTOBOT_GRAPHQL_URL = "https://nautobot.example.com/api/graphql/"
 NAUTOBOT_TOKEN = "CHANGE_ME"
 NAUTOBOT_VERIFY = True
 NAUTOBOT_TIMEOUT = 30
-NAUTOBOT_PAGE_SIZE = 500
+NAUTOBOT_PAGE_SIZE = 50
+NAUTOBOT_MAX_RPS = 30
 
-SPLUNK_HEC_URL = "https://splunk.example.com:8088/services/collector"
-SPLUNK_HEC_TOKEN = "CHANGE_ME"
-SPLUNK_HEC_INDEX = "nautobot"
-SPLUNK_HEC_SOURCE = "nautobot"
-SPLUNK_HEC_BATCH_SIZE = 200
-SPLUNK_HEC_VERIFY = True
-SPLUNK_HEC_TIMEOUT = 30
+# Output and logging
+OUTPUT_DIR = "output_splunk_nautobot"
+LOG_FILE = os.path.join(OUTPUT_DIR, "nautobot_export.log")
 
+# GraphQL queries
 DEVICE_QUERY = """
 query DeviceInventory($limit: Int!, $offset: Int!) {
   devices(limit: $limit, offset: $offset) {
@@ -45,121 +47,21 @@ query DeviceInventory($limit: Int!, $offset: Int!) {
 }
 """
 
-IP_ADDRESS_QUERY = """
-query IpAddressInventory($limit: Int!, $offset: Int!) {
-  ip_addresses(limit: $limit, offset: $offset) {
-    address
-    status { name }
-    role { name }
-    dns_name
-    description
-    tenant { name }
-    vrf { name }
-    tags { name }
-    custom_fields
-    created
-    last_updated
-    assigned_object {
-      ... on Interface { name device { name } }
-      ... on VMInterface { name virtual_machine { name } }
-    }
-  }
-}
-"""
-
-PREFIX_QUERY = """
-query PrefixInventory($limit: Int!, $offset: Int!) {
-  prefixes(limit: $limit, offset: $offset) {
-    prefix
-    status { name }
-    role { name }
-    description
-    is_pool
-    site { name }
-    tenant { name }
-    vrf { name }
-    vlan { name vid }
-    tags { name }
-    custom_fields
-    created
-    last_updated
-  }
-}
-"""
-
-VLAN_QUERY = """
-query VlanInventory($limit: Int!, $offset: Int!) {
-  vlans(limit: $limit, offset: $offset) {
-    name
-    vid
-    status { name }
-    role { name }
-    description
-    site { name }
-    group { name }
-    tenant { name }
-    tags { name }
-    custom_fields
-    created
-    last_updated
-  }
-}
-"""
-
-VRF_QUERY = """
-query VrfInventory($limit: Int!, $offset: Int!) {
-  vrfs(limit: $limit, offset: $offset) {
-    name
-    rd
-    tenant { name }
-    enforce_unique
-    description
-    tags { name }
-    custom_fields
-    created
-    last_updated
-  }
-}
-"""
-
+# Export list (name, query)
 EXPORTS = [
-    {
-        "name": "devices",
-        "query": DEVICE_QUERY,
-        "root": "devices",
-        "sourcetype": "nautobot:device",
-        "host_key": "name",
-    },
-    {
-        "name": "ip_addresses",
-        "query": IP_ADDRESS_QUERY,
-        "root": "ip_addresses",
-        "sourcetype": "nautobot:ip_address",
-    },
-    {
-        "name": "prefixes",
-        "query": PREFIX_QUERY,
-        "root": "prefixes",
-        "sourcetype": "nautobot:prefix",
-    },
-    {
-        "name": "vlans",
-        "query": VLAN_QUERY,
-        "root": "vlans",
-        "sourcetype": "nautobot:vlan",
-    },
-    {
-        "name": "vrfs",
-        "query": VRF_QUERY,
-        "root": "vrfs",
-        "sourcetype": "nautobot:vrf",
-    },
+    ("devices", DEVICE_QUERY),
+    ("ip_addresses", IP_ADDRESS_QUERY),
+    ("prefixes", PREFIX_QUERY),
+    ("vlans", VLAN_QUERY),
+    ("vrfs", VRF_QUERY),
 ]
 
-# Function to prune empty values from data structures
+
+# Remove empty values to reduce output size
 def prune_empty(value):
     if value is None:
         return None
+    
     if isinstance(value, dict):
         cleaned = {}
         for key, item in value.items():
@@ -168,6 +70,7 @@ def prune_empty(value):
                 continue
             cleaned[key] = cleaned_item
         return cleaned or None
+    
     if isinstance(value, list):
         cleaned_list = []
         for item in value:
@@ -176,82 +79,91 @@ def prune_empty(value):
                 continue
             cleaned_list.append(cleaned_item)
         return cleaned_list or None
+    
     if isinstance(value, str) and value == "":
         return None
     return value
 
-# Function to send a batch of events to Splunk HEC
-def send_batch(session, events):
-    if not events:
-        return 0
-    payload = "\n".join(json.dumps(event, ensure_ascii=True) for event in events)
-    response = session.post(
-        SPLUNK_HEC_URL,
-        data=payload,
-        headers={"Authorization": f"Splunk {SPLUNK_HEC_TOKEN}"},
-        timeout=SPLUNK_HEC_TIMEOUT,
-        verify=SPLUNK_HEC_VERIFY,
-    )
-    response.raise_for_status()
-    return len(events)
 
-# Main function to perform GraphQL queries and send data to Splunk HEC
-def graphql(query, root, sourcetype, host_key=None):
-    session = requests.Session()
+# Log to console and file
+def log_message(log_fh, message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{timestamp} {message}"
+    print(line)
+    log_fh.write(line + "\n")
+    log_fh.flush()
+
+
+# Export one object type to JSON
+def export_items(session, name, query, log_fh):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, f"{name}.json")
     offset = 0
-    sent = 0
-    batch = []
+    last_request = 0.0
+    min_interval = 1.0 / float(max(1, NAUTOBOT_MAX_RPS))
+    count = 0
+    first = True
 
-    while True:
-        response = session.post(
-            NAUTOBOT_GRAPHQL_URL,
-            json={"query": query, "variables": {"limit": NAUTOBOT_PAGE_SIZE, "offset": offset}},
-            headers={"Authorization": f"Token {NAUTOBOT_TOKEN}"},
-            timeout=NAUTOBOT_TIMEOUT,
-            verify=NAUTOBOT_VERIFY,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if data.get("errors"):
-            raise RuntimeError(f"Errors: {data['errors']}")
+    log_message(log_fh, f"{name}: start export -> {output_path}")
 
-        items = data.get("data", {}).get(root, [])
-        if not items:
-            break
+    with open(output_path, "w", encoding="utf-8") as fh:
+        fh.write("[")
+        while True:
+            elapsed = time.monotonic() - last_request
+            if last_request and elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
 
-        for item in items:
-            item = prune_empty(item)
-            if not item:
-                continue
-            event = {
-                "index": SPLUNK_HEC_INDEX,
-                "sourcetype": sourcetype,
-                "source": SPLUNK_HEC_SOURCE,
-                "event": item,
-            }
-            if host_key and item.get(host_key):
-                event["host"] = item[host_key]
+            response = session.post(
+                NAUTOBOT_GRAPHQL_URL,
+                json={"query": query, "variables": {"limit": NAUTOBOT_PAGE_SIZE, "offset": offset}},
+                headers={"Authorization": f"Token {NAUTOBOT_TOKEN}"},
+                timeout=NAUTOBOT_TIMEOUT,
+                verify=NAUTOBOT_VERIFY,
+            )
+            last_request = time.monotonic()
+            response.raise_for_status()
+            data = response.json()
 
-            batch.append(event)
+            if data.get("errors"):
+                raise RuntimeError(f"Errors: {data['errors']}")
 
-            if len(batch) >= SPLUNK_HEC_BATCH_SIZE:
-                sent += send_batch(session, batch)
-                batch = []
+            items = data.get("data", {}).get(name, [])
+            if not items:
+                break
 
-        if len(items) < NAUTOBOT_PAGE_SIZE:
-            break
-        offset += NAUTOBOT_PAGE_SIZE
+            log_message(log_fh, f"{name}: page offset {offset} items {len(items)}")
+            for item in items:
+                item = prune_empty(item)
+                if not item:
+                    continue
+                if not first:
+                    fh.write(",\n")
+                fh.write(json.dumps(item, ensure_ascii=True))
+                first = False
+                count += 1
 
-    sent += send_batch(session, batch)
-    print(f"Sent {sent} {root}.")
-    return 0
+            if len(items) < NAUTOBOT_PAGE_SIZE:
+                break
+            offset += NAUTOBOT_PAGE_SIZE
+
+        fh.write("]\n")
+
+    log_message(log_fh, f"{name}: done {count} items -> {output_path}")
+    return count
+
 
 
 if __name__ == "__main__":
-    for export in EXPORTS:
-        graphql(
-            export["query"],
-            export["root"],
-            export["sourcetype"],
-            export.get("host_key"),
-        )
+    session = requests.Session()
+    total = 0
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    with open(LOG_FILE, "a", encoding="utf-8") as log_fh:
+        log_message(log_fh, "Run start")
+        try:
+            for name, query in EXPORTS:
+                total += export_items(session, name, query, log_fh)
+            log_message(log_fh, f"Run done. Wrote {total} items.")
+        except Exception as exc:
+            log_message(log_fh, f"Run failed: {exc}")
+            raise
