@@ -162,10 +162,10 @@ def prune_empty(value):
 
 
 # Log to console and file
-async def log_message(log_fh, log_lock, message):
+async def log_message(log_fh, log_lock, message, status="INFO"):
     async with log_lock:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        line = f"{timestamp} {message}"
+        line = f"{timestamp} [{status}] {message}"
         print(line)
         log_fh.write(line + "\n")
         log_fh.flush()
@@ -276,7 +276,7 @@ async def main():
             total = sum(results)
             await log_message(log_fh, log_lock, f"Run done. Wrote {total} items.")
         except Exception as exc:
-            await log_message(log_fh, log_lock, f"Run failed: {exc}")
+            await log_message(log_fh, log_lock, f"Run failed: {exc}", status="ERROR")
             raise
     return 0
 
